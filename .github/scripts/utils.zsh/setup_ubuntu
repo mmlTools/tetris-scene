@@ -42,7 +42,15 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     build-essential \
     libgles2-mesa-dev \
     libsimde-dev \
-    obs-studio
+    obs-studio \
+    libobs-dev
+
+  # Some OBS repositories/package versions expose the development CMake files
+  # under obs-studio-dev instead of libobs-dev. Keep this as a best-effort
+  # fallback so GitHub Actions does not fail before CMake can find libobs.
+  if ! cmake --find-package -DNAME=libobs -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=EXIST >/dev/null 2>&1; then
+    sudo apt-get install ${apt_args} obs-studio-dev || true
+  fi
 
   local -a _qt_packages=()
 
