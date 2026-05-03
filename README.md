@@ -1,59 +1,76 @@
-# OBS Plugin Template
+# OBS Tetris Plugin
 
-## Introduction
+Play Tetris directly inside OBS Studio as a source in your scenes.
+Useful for livestreams, waiting screens, or interactive content.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+## Features
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+- Playable Tetris inside OBS
+- Live Score, Level, Lines, Timer
+- Next piece preview
+- Pause and Game Over messages
+- Lightweight and smooth (no external UI)
 
-## Supported Build Environments
+## Installation
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+### Windows
+1. Download the plugin release .zip
+2. Extract into your OBS installation folder:
+   C:\Program Files\obs-studio\
+3. Restart OBS Studio
 
-## Quick Start
+### Linux
+1. Build or install the plugin
+2. Copy the .so file into:
+   ~/.config/obs-studio/plugins/
+3. Restart OBS Studio
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+## Add Tetris to Your Scene
 
-## Documentation
+1. Open OBS
+2. Go to Sources
+3. Click + (Add)
+4. Select "OBS Tetris"
+5. Resize and position as needed
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+## Controls (Hotkeys)
 
-Suggested reading to get up and running:
+You must configure controls manually:
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+1. Go to Settings → Hotkeys
+2. Find the OBS Tetris section
+3. Bind keys for:
 
-## GitHub Actions & CI
+- Move Left
+- Move Right
+- Rotate
+- Soft Drop
+- Hard Drop
+- Pause
+- Reset
 
-Default GitHub Actions workflows are available for the following repository actions:
+Tip: Use comfortable keys like:
+- Arrow keys (movement)
+- Up (rotate)
+- Down (drop)
+- Space (hard drop)
+- P (pause)
 
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
+## How It Works
 
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
+- The game runs as a native OBS source
+- No browser sources or external apps needed
+- Works in recordings and livestreams
 
-### Retrieving build artifacts
+## Notes
 
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
+- Game only responds to configured hotkeys
+- Make sure OBS is focused when playing
+- Reset is required after Game Over
 
-### Building a Release
+## Use Cases
 
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
-
-## Signing and Notarizing on macOS
-
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+- Stream starting screens
+- Intermission content
+- Chat challenges / engagement
+- General stream interaction
