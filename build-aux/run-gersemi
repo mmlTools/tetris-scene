@@ -1,1 +1,6 @@
-.run-format.zsh
+#!/usr/bin/env zsh
+
+# Entry point for .run-format.zsh (a plain script instead of a symlink so it survives Windows checkouts)
+export FORMATTER_NAME=gersemi
+export SCRIPT_HOME=${0:A:h}
+exec zsh ${SCRIPT_HOME}/.run-format.zsh "$@"

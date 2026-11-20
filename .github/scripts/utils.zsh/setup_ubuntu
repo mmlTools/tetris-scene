@@ -40,52 +40,75 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     sudo apt-get install ${apt_args} gcc-${${target##*-}//_/-}-linux-gnu g++-${${target##*-}//_/-}-linux-gnu
   }
 
-  # Distribution obs-studio/libobs-dev packages lag behind (Ubuntu 26.04 ships 32.x): always build against
-  # the official OBS Studio PPA, which ships libobs headers and CMake package files in its obs-studio package.
-  # The PPA is registered explicitly with its own keyring (add-apt-repository can leave it unsigned, which
-  # makes apt silently ignore it) and pinned above the distribution archive.
+  # Distribution obs-studio/libobs-dev packages lag behind (Ubuntu 26.04 ships 32.x): always build against the
+  # official OBS Studio PPA, whose obs-studio package ships the libobs headers and CMake package files.
+  # The package is fetched straight from the PPA instead of through an apt source: Ubuntu 26.04 runners prefer the
+  # "amd64v3" architecture variant, for which the PPA publishes an empty index, so apt never sees the PPA build.
+  # Integrity chain: PPA key (fingerprint from Launchpad) -> signed InRelease -> Packages.gz SHA256 -> .deb SHA256.
   local -r ppa_url='https://ppa.launchpadcontent.net/obsproject/obs-studio/ubuntu'
-  local -r ppa_keyring='/etc/apt/keyrings/obsproject-obs-studio.gpg'
   local codename
+  local arch
   codename="$(. /etc/os-release && print -r -- ${VERSION_CODENAME})"
-
-  sudo mkdir -p /etc/apt/keyrings /etc/apt/preferences.d
+  arch="$(dpkg --print-architecture)"
+  local work_dir
+  work_dir="$(mktemp -d)"
+  chmod 755 ${work_dir}
 
   local fingerprint
   for attempt in {1..3}; do
     fingerprint="$(curl -fsSL https://api.launchpad.net/1.0/~obsproject/+archive/ubuntu/obs-studio | jq -r '.signing_key_fingerprint')" && \
       [[ ${fingerprint} =~ '^[0-9A-F]{40}$' ]] && \
-      curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${fingerprint}" \
-        | sudo gpg --batch --yes --dearmor -o ${ppa_keyring} && break
+      curl -fsSL -o ${work_dir}/ppa.asc "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${fingerprint}" && \
+      curl -fsSL -o ${work_dir}/InRelease "${ppa_url}/dists/${codename}/InRelease" && \
+      curl -fsSL -o ${work_dir}/Packages.gz "${ppa_url}/dists/${codename}/main/binary-${arch}/Packages.gz" && break
     fingerprint=''
     sleep $(( attempt * 15 ))
   done
 
   if [[ -z ${fingerprint} ]] {
-    log_error 'Could not fetch the obsproject PPA signing key.'
+    log_error "Could not download the obsproject PPA key and index for Ubuntu '${codename}' (${arch})."
     return 2
   }
 
-  print -r -- "Types: deb
-URIs: ${ppa_url}
-Suites: ${codename}
-Components: main
-Signed-By: ${ppa_keyring}" | sudo tee /etc/apt/sources.list.d/obsproject-obs-studio.sources >/dev/null
-  print -r -- "Package: *
-Pin: release o=LP-PPA-obsproject-obs-studio
-Pin-Priority: 1001" | sudo tee /etc/apt/preferences.d/obsproject-obs-studio >/dev/null
-
-  if ! _apt_update; then
-    log_error 'apt-get update failed after adding the obsproject PPA.'
+  gpg --batch --yes --dearmor -o ${work_dir}/ppa.gpg ${work_dir}/ppa.asc
+  if ! gpgv --keyring ${work_dir}/ppa.gpg ${work_dir}/InRelease; then
+    log_error 'The obsproject PPA InRelease signature could not be verified.'
     return 2
   fi
 
-  apt-cache policy obs-studio
+  local index_sha
+  index_sha="$(awk -v f="main/binary-${arch}/Packages.gz" '/^SHA256:/ { s = 1; next } /^[^ ]/ { s = 0 } s && $3 == f { print $1 }' ${work_dir}/InRelease)"
+  if [[ -z ${index_sha} || "$(sha256sum ${work_dir}/Packages.gz | cut -d' ' -f1)" != ${index_sha} ]] {
+    log_error 'The obsproject PPA package index does not match its signed checksum.'
+    return 2
+  }
+
+  local deb_info
+  deb_info="$(gzip -dc ${work_dir}/Packages.gz | awk 'BEGIN { RS = ""; FS = "\n" } {
+    pkg = ""; ver = ""; file = ""; sha = ""
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /^Package: /) pkg = substr($i, 10)
+      else if ($i ~ /^Version: /) ver = substr($i, 10)
+      else if ($i ~ /^Filename: /) file = substr($i, 11)
+      else if ($i ~ /^SHA256: /) sha = substr($i, 9)
+    }
+    if (pkg == "obs-studio") print ver " " file " " sha
+  }' | sort -V | tail -n 1)"
 
   local ppa_version
-  ppa_version="$(apt-cache madison obs-studio | awk -F'|' '/launchpadcontent|obsproject/ && !v { gsub(/ /, "", $2); v = $2 } END { print v }')"
-  if [[ -z ${ppa_version} ]] {
-    log_error "The obsproject PPA has no obs-studio package for Ubuntu '${codename}'."
+  local deb_path
+  local deb_sha
+  read -r ppa_version deb_path deb_sha <<< "${deb_info}"
+  if [[ -z ${deb_path} || -z ${deb_sha} ]] {
+    log_error "The obsproject PPA has no obs-studio package for Ubuntu '${codename}' (${arch})."
+    return 2
+  }
+
+  local deb_file="${work_dir}/${deb_path:t}"
+  log_info "Downloading obs-studio ${ppa_version} from the obsproject PPA..."
+  curl -fsSL --retry 3 -o ${deb_file} "${ppa_url}/${deb_path}"
+  if [[ "$(sha256sum ${deb_file} | cut -d' ' -f1)" != ${deb_sha} ]] {
+    log_error "Checksum mismatch for ${deb_path:t}."
     return 2
   }
 
@@ -94,12 +117,18 @@ Pin-Priority: 1001" | sudo tee /etc/apt/preferences.d/obsproject-obs-studio >/de
     sudo apt-get remove ${apt_args} libobs-dev
   fi
 
-  sudo apt-get install ${apt_args} --allow-downgrades \
+  if ! _apt_update; then
+    log_error 'apt-get update failed.'
+    return 2
+  fi
+
+  # apt installs the local .deb and resolves its runtime dependencies from the Ubuntu archive
+  sudo apt-get install ${apt_args} \
     build-essential \
     libgles2-mesa-dev \
     libsimde-dev \
-    obs-studio=${ppa_version}
-
+    ${deb_file}
+  rm -rf ${work_dir}
   local obs_version
   obs_version="$(dpkg-query -W -f='${Version}' obs-studio 2>/dev/null)"
   obs_version="${${obs_version#*:}%%-*}"

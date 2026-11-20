@@ -62,6 +62,8 @@ function(_setup_obs_studio)
     set(_cmake_extra "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
   endif()
 
+  # libobs is only a dependency here: newer compilers than the one OBS was released with can add warnings
+  # (e.g. MSVC 14.52 C4244 in obs-properties.c), so they must not fail the build.
   message(STATUS "Configure ${label} (${arch})")
   execute_process(
     COMMAND
@@ -69,7 +71,7 @@ function(_setup_obs_studio)
       "${dependencies_dir}/${_obs_destination}/build_${arch}" -G ${_cmake_generator} "${_cmake_arch}"
       -DOBS_CMAKE_VERSION:STRING=3.0.0 -DENABLE_PLUGINS:BOOL=OFF -DENABLE_FRONTEND:BOOL=OFF
       -DOBS_VERSION_OVERRIDE:STRING=${_obs_version} "-DCMAKE_PREFIX_PATH='${CMAKE_PREFIX_PATH}'" ${_is_fresh}
-      ${_cmake_extra}
+      ${_cmake_extra} -DCMAKE_COMPILE_WARNING_AS_ERROR:BOOL=OFF
     RESULT_VARIABLE _process_result
     OUTPUT_VARIABLE _process_output
     ERROR_VARIABLE _process_output
