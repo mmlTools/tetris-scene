@@ -14,101 +14,73 @@ pushd ${project_root}
 
 typeset -g QT_VERSION
 
+# Minimum OBS Studio version the plugin is built against (keep in sync with buildspec.json)
+local -r obs_minimum_version='33.0.0'
+
 local -a apt_args=(
   ${CI:+-y}
   --no-install-recommends
 )
 if (( _loglevel == 0 )) apt_args+=(--quiet)
 
-if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
-  log_group 'Installing obs-studio build dependencies...'
-
-  local suffix
-  if [[ ${CPUTYPE} != "${target##*-}" ]] {
-    local -A arch_mappings=(
-      aarch64 arm64
-      x86_64 amd64
-    )
-
-    suffix=":${arch_mappings[${target##*-}]}"
-
-    sudo apt-get install ${apt_args} gcc-${${target##*-}//_/-}-linux-gnu g++-${${target##*-}//_/-}-linux-gnu
-  }
-
-  local apt_updated=0
-
+_apt_update() {
   for attempt in {1..3}; do
     if sudo apt-get update; then
-      apt_updated=1
-      break
+      return 0
     fi
     sleep $(( attempt * 10 ))
   done
+  return 1
+}
 
-  if (( ! apt_updated )) {
-    log_error "apt-get update failed after retries."
+if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
+  log_group 'Installing obs-studio build dependencies...'
+
+  if [[ ${CPUTYPE} != "${target##*-}" ]] {
+    sudo apt-get install ${apt_args} gcc-${${target##*-}//_/-}-linux-gnu g++-${${target##*-}//_/-}-linux-gnu
+  }
+
+  # Distribution libobs-dev packages lag behind: always build against the official OBS Studio PPA,
+  # which ships libobs headers and CMake package files inside the obs-studio package.
+  local ppa_added=0
+  for attempt in {1..3}; do
+    if sudo add-apt-repository --yes ppa:obsproject/obs-studio; then
+      ppa_added=1
+      break
+    fi
+    sleep $(( attempt * 15 ))
+  done
+
+  if (( ! ppa_added )) {
+    log_error 'Could not add the obsproject PPA after retries.'
     return 2
   }
 
-  local obs_dev_package_available=0
-  if apt-cache show libobs-dev >/dev/null 2>&1; then
-    obs_dev_package_available=1
+  if ! _apt_update; then
+    log_error 'apt-get update failed after adding the obsproject PPA.'
+    return 2
   fi
 
-  if (( ! obs_dev_package_available )) {
-    local ppa_added=0
-    for attempt in {1..3}; do
-      if sudo add-apt-repository --yes ppa:obsproject/obs-studio; then
-        ppa_added=1
-        break
-      fi
-      sleep $(( attempt * 15 ))
-    done
-
-    if (( ! ppa_added )) {
-      log_error "Could not add obsproject PPA after retries."
-      return 2
-    }
-
-    apt_updated=0
-    for attempt in {1..3}; do
-      if sudo apt-get update; then
-        apt_updated=1
-        break
-      fi
-      sleep $(( attempt * 10 ))
-    done
-
-    if (( ! apt_updated )) {
-      log_error "apt-get update failed after adding obsproject PPA."
-      return 2
-    }
-  }
+  # Never mix the distribution's libobs-dev with the PPA build
+  if dpkg -s libobs-dev >/dev/null 2>&1; then
+    sudo apt-get remove ${apt_args} libobs-dev
+  fi
 
   sudo apt-get install ${apt_args} \
     build-essential \
     libgles2-mesa-dev \
     libsimde-dev \
-    obs-studio \
-    libobs-dev
+    obs-studio
 
-  local -a _qt_packages=()
+  local obs_version
+  obs_version="$(dpkg-query -W -f='${Version}' obs-studio 2>/dev/null)"
+  obs_version="${${obs_version#*:}%%-*}"
 
-  if (( QT_VERSION == 5 )) {
-    _qt_packages+=(
-      qtbase5-dev${suffix}
-      libqt5svg5-dev${suffix}
-      qtbase5-private-dev${suffix}
-      libqt5x11extras5-dev${suffix}
-    )
-  } else {
-    _qt_packages+=(
-      qt6-base-dev${suffix}
-      libqt6svg6-dev${suffix}
-      qt6-base-private-dev${suffix}
-    )
-  }
-
-  sudo apt-get install ${apt_args} ${_qt_packages}
+  autoload -Uz is-at-least
+  if [[ -z ${obs_version} ]] || ! is-at-least ${obs_minimum_version} ${obs_version}; then
+    log_error "OBS Studio ${obs_minimum_version}+ is required, but the PPA provided '${obs_version}'. Use an Ubuntu release supported by the OBS PPA for OBS ${obs_minimum_version%%.*} (e.g. ubuntu-26.04)."
+    return 2
+  fi
+  log_info "Building against OBS Studio ${obs_version}"
   log_group
 }

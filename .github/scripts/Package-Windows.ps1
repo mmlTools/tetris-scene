@@ -26,25 +26,17 @@ if ( $PSVersionTable.PSVersion -lt '7.2.0' ) {
     exit 2
 }
 
-function Copy-DirectoryContents {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string] $Source,
-        [Parameter(Mandatory = $true)]
-        [string] $Destination
-    )
-
-    if ( ! ( Test-Path -LiteralPath $Source ) ) {
-        return
-    }
-
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-
-    Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $Destination -Recurse -Force
-    }
-}
-
+# Produces an archive using the OBS Studio 33+ plugin layout:
+#
+#   <name>-<version>-windows-x64.zip
+#   └── <name>/
+#       ├── <name>.dll
+#       └── data/
+#           ├── manifest.json
+#           └── locale/...
+#
+# Users extract it into C:\ProgramData\obs-studio\plugins\ (a folder OBS creates on first start).
+# Debug symbols go into a separate <name>-<version>-windows-x64-pdb.zip.
 function Package {
     trap {
         Write-Error $_
@@ -68,9 +60,8 @@ function Package {
 
     $OutputName = "${ProductName}-${ProductVersion}-windows-${Target}"
     $InstallRoot = Resolve-Path -Path "${ProjectRoot}/release/${Configuration}"
-    $StageRoot = "${ProjectRoot}/release/${OutputName}"
-    $PluginBinaryRoot = "${StageRoot}/obs-plugins/64bit"
-    $PluginDataRoot = "${StageRoot}/data/obs-plugins/${ProductName}"
+    $StageRoot = "${ProjectRoot}/release/stage-${Target}"
+    $PluginRoot = "${StageRoot}/${ProductName}"
 
     $RemoveArgs = @{
         ErrorAction = 'SilentlyContinue'
@@ -79,114 +70,48 @@ function Package {
             $StageRoot
         )
     }
-
     Remove-Item @RemoveArgs -Recurse -Force
 
-    New-Item -ItemType Directory -Force -Path $PluginBinaryRoot | Out-Null
-    New-Item -ItemType Directory -Force -Path $PluginDataRoot | Out-Null
-
-    $DllCandidates = @(
-        "${InstallRoot}/obs-plugins/64bit/${ProductName}.dll",
-        "${InstallRoot}/obs-plugins/64bit/${ProductName}-plugin.dll",
-        "${InstallRoot}/bin/64bit/${ProductName}.dll",
-        "${InstallRoot}/bin/64bit/${ProductName}-plugin.dll",
-        "${InstallRoot}/${ProductName}.dll",
-        "${InstallRoot}/${ProductName}-plugin.dll"
-    )
-
-    $CopiedDll = $false
-
-    foreach ( $Candidate in $DllCandidates ) {
-        if ( Test-Path -LiteralPath $Candidate ) {
-            Copy-Item -LiteralPath $Candidate -Destination $PluginBinaryRoot -Force
-            $CopiedDll = $true
-        }
+    $Dll = "${InstallRoot}/${ProductName}/${ProductName}.dll"
+    if ( ! ( Test-Path -LiteralPath $Dll ) ) {
+        throw "Plugin binary not found at ${Dll}. Was the project installed with 'cmake --install'?"
     }
 
-    if ( ! $CopiedDll ) {
-        $FoundDlls = Get-ChildItem -LiteralPath $InstallRoot -Recurse -File -Filter '*.dll' |
-            Where-Object {
-                $_.Name -eq "${ProductName}.dll" -or
-                $_.Name -eq "${ProductName}-plugin.dll" -or
-                $_.DirectoryName -match 'obs-plugins|bin\\64bit|bin/64bit'
-            }
-
-        foreach ( $Dll in $FoundDlls ) {
-            Copy-Item -LiteralPath $Dll.FullName -Destination $PluginBinaryRoot -Force
-            $CopiedDll = $true
-        }
+    $Manifest = "${InstallRoot}/${ProductName}/data/manifest.json"
+    if ( ! ( Test-Path -LiteralPath $Manifest ) ) {
+        throw "Plugin manifest not found at ${Manifest}."
     }
 
-    if ( ! $CopiedDll ) {
-        throw "Could not find the plugin DLL under ${InstallRoot}."
-    }
+    Log-Group "Staging ${ProductName} (OBS 33+ layout)..."
+    New-Item -ItemType Directory -Force -Path $PluginRoot | Out-Null
+    Copy-Item -LiteralPath $Dll -Destination $PluginRoot -Force
+    Copy-Item -LiteralPath "${InstallRoot}/${ProductName}/data" -Destination $PluginRoot -Recurse -Force
 
-    $CopiedData = $false
-
-    $ExactDataCandidates = @(
-        "${InstallRoot}/data/obs-plugins/${ProductName}",
-        "${InstallRoot}/data/${ProductName}"
-    )
-
-    foreach ( $Candidate in $ExactDataCandidates ) {
-        if ( Test-Path -LiteralPath $Candidate ) {
-            Copy-DirectoryContents -Source $Candidate -Destination $PluginDataRoot
-            $CopiedData = $true
-            break
-        }
-    }
-
-    if ( ! $CopiedData ) {
-        $ObsPluginsDataRoot = "${InstallRoot}/data/obs-plugins"
-        if ( Test-Path -LiteralPath $ObsPluginsDataRoot ) {
-            $DataFolders = Get-ChildItem -LiteralPath $ObsPluginsDataRoot -Directory -Force
-            if ( $DataFolders.Count -eq 1 ) {
-                Copy-DirectoryContents -Source $DataFolders[0].FullName -Destination $PluginDataRoot
-                $CopiedData = $true
-            } elseif ( Test-Path -LiteralPath "${ObsPluginsDataRoot}/${ProductName}" ) {
-                Copy-DirectoryContents -Source "${ObsPluginsDataRoot}/${ProductName}" -Destination $PluginDataRoot
-                $CopiedData = $true
-            }
-        }
-    }
-
-    if ( ! $CopiedData -and ( Test-Path -LiteralPath "${InstallRoot}/data" ) ) {
-        $TopLevelDataItems = Get-ChildItem -LiteralPath "${InstallRoot}/data" -Force |
-            Where-Object { $_.Name -ne 'obs-plugins' }
-
-        if ( $TopLevelDataItems.Count -gt 0 ) {
-            foreach ( $Item in $TopLevelDataItems ) {
-                Copy-Item -LiteralPath $Item.FullName -Destination $PluginDataRoot -Recurse -Force
-            }
-            $CopiedData = $true
-        }
-    }
-
-    if ( ! $CopiedData ) {
-        $KnownDataFolders = @('locale', 'locales', 'locale.ini', 'locales.ini', 'images', 'sounds')
-        foreach ( $Name in $KnownDataFolders ) {
-            $Matches = Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq $Name }
-
-            foreach ( $Match in $Matches ) {
-                if ( $Match.PSIsContainer ) {
-                    Copy-Item -LiteralPath $Match.FullName -Destination $PluginDataRoot -Recurse -Force
-                } else {
-                    Copy-Item -LiteralPath $Match.FullName -Destination $PluginDataRoot -Force
-                }
-                $CopiedData = $true
-            }
-        }
+    Get-ChildItem -LiteralPath $StageRoot -Recurse -File | ForEach-Object {
+        Write-Information ($_.FullName.Substring($StageRoot.Length + 1))
     }
 
     Log-Group "Archiving ${ProductName}..."
     $CompressArgs = @{
-        Path = (Get-ChildItem -LiteralPath $StageRoot)
+        Path = $PluginRoot
         CompressionLevel = 'Optimal'
         DestinationPath = "${ProjectRoot}/release/${OutputName}.zip"
         Verbose = ($Env:CI -ne $null)
     }
     Compress-Archive -Force @CompressArgs
+
+    $Pdbs = @(Get-ChildItem -Path "${InstallRoot}/debug-symbols" -Filter '*.pdb' -File -ErrorAction SilentlyContinue)
+    if ( $Pdbs.Count -gt 0 ) {
+        Log-Group "Archiving ${ProductName} debug symbols..."
+        $PdbArgs = @{
+            Path = $Pdbs.FullName
+            CompressionLevel = 'Optimal'
+            DestinationPath = "${ProjectRoot}/release/${OutputName}-pdb.zip"
+        }
+        Compress-Archive -Force @PdbArgs
+    }
+
+    Remove-Item -LiteralPath $StageRoot -Recurse -Force
     Log-Group
 }
 

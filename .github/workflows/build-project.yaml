@@ -20,7 +20,7 @@ jobs:
       commitHash: ${{ steps.setup.outputs.commitHash }}
       pluginName: ${{ steps.setup.outputs.pluginName }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Check Event Data ☑️
@@ -73,13 +73,13 @@ jobs:
 
   macos-build:
     name: Build for macOS 🍏
-    runs-on: macos-15
+    runs-on: macos-26
     needs: check-event
     defaults:
       run:
         shell: zsh --no-rcs --errexit --pipefail {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
@@ -90,8 +90,8 @@ jobs:
           : Set Up Environment 🔧
           if (( ${+RUNNER_DEBUG} )) setopt XTRACE
 
-          print '::group::Enable Xcode 16.1'
-          sudo xcode-select --switch /Applications/Xcode_16.1.0.app/Contents/Developer
+          print '::group::Enable Xcode 26.5'
+          sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer
           print '::endgroup::'
 
           print '::group::Clean Homebrew Environment'
@@ -112,7 +112,7 @@ jobs:
           print "pluginName=${product_name}" >> $GITHUB_OUTPUT
           print "pluginVersion=${product_version}" >> $GITHUB_OUTPUT
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         id: ccache-cache
         with:
           path: ${{ github.workspace }}/.ccache
@@ -157,19 +157,19 @@ jobs:
           codesignPass: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
 
       - name: Upload Artifacts 📡
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal.*
 
       - name: Upload Debug Symbol Artifacts 🪲
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: ${{ needs.check-event.outputs.config == 'Release' }}
         with:
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal-${{ needs.check-event.outputs.commitHash }}-dSYMs
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal-dSYMs.*
 
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: github.event_name != 'pull_request' && steps.ccache-cache.outputs.cache-hit != 'true'
         with:
           path: ${{ github.workspace }}/.ccache
@@ -179,14 +179,14 @@ jobs:
     name: Build for Ubuntu 🐧
     strategy:
       matrix:
-        os: [ubuntu-24.04]
+        os: [ubuntu-26.04]
     runs-on: ${{ matrix.os }}
     needs: check-event
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
@@ -203,33 +203,10 @@ jobs:
           echo "pluginName=${product_name}" >> $GITHUB_OUTPUT
           echo "pluginVersion=${product_version}" >> $GITHUB_OUTPUT
 
-      - name: Install Ubuntu build dependencies
-        run: |
-          for attempt in 1 2 3; do
-            sudo apt-get update && break
-            sleep $(( attempt * 10 ))
-          done
-          sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            build-essential \
-            pkg-config \
-            libx11-dev \
-            libxrandr-dev \
-            libxi-dev \
-            libxinerama-dev \
-            libxcursor-dev \
-            libgl1-mesa-dev \
-            libgles2-mesa-dev \
-            libsimde-dev \
-            libobs-dev \
-            obs-studio \
-            qt6-base-dev \
-            qt6-base-dev-tools \
-            libqt6svg6-dev \
-            qt6-base-private-dev
+      # OBS Studio 33+ (headers + CMake packages) is installed from the official PPA by
+      # .github/scripts/utils.zsh/setup_ubuntu during the build step.
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         id: ccache-cache
         with:
           path: ${{ github.workspace }}/.ccache
@@ -251,17 +228,17 @@ jobs:
           package: ${{ fromJSON(needs.check-event.outputs.package) }}
 
       - name: Upload Artifacts 📡
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-ubuntu-24.04-x86_64-${{ needs.check-event.outputs.commitHash }}
+          name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-ubuntu-26.04-x86_64-${{ needs.check-event.outputs.commitHash }}
           path: |
-            ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-x86_64-ubuntu-gnu.tar.xz
+            ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-x86_64-linux-gnu.tar.xz
             ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-x86_64-linux-gnu.deb
             ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-x86_64-linux-gnu.ddeb
             ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-x86_64-linux-gnu-dbgsym.ddeb
           if-no-files-found: warn
 
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: github.event_name != 'pull_request' && steps.ccache-cache.outputs.cache-hit != 'true'
         with:
           path: ${{ github.workspace }}/.ccache
@@ -269,13 +246,13 @@ jobs:
 
   windows-build:
     name: Build for Windows 🪟
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     needs: check-event
     defaults:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
@@ -309,7 +286,7 @@ jobs:
           package: ${{ fromJSON(needs.check-event.outputs.package) }}
 
       - name: Upload Artifacts 📡
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64*.*

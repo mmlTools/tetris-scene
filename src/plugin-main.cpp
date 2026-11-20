@@ -1,614 +1,642 @@
 /*
-OBS Tetris Source
-Minimal playable Tetris source for OBS Studio.
+Stack Party - chat-powered falling-block game source for OBS Studio
+Copyright (C) 2026 MMLTECH
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#include "chat-bridge.hpp"
+#include "game.hpp"
+#include "render.hpp"
+
 #include <algorithm>
 #include <array>
-#include <cstdint>
-#include <cmath>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
-#include <functional>
-#include <cstdio>
 #include <vector>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
+OBS_MODULE_AUTHOR("MMLTECH")
+
+MODULE_EXPORT const char *obs_module_name(void)
+{
+	return "Stack Party";
+}
+
+MODULE_EXPORT const char *obs_module_description(void)
+{
+	return obs_module_text("Module.Description");
+}
 
 namespace {
-constexpr int BoardW = 10;
-constexpr int BoardH = 20;
-constexpr int PieceSize = 4;
-constexpr uint32_t Empty = 0x00000000;
 
-static const std::array<std::array<const char *, 4>, 7> Pieces = {{
-	{{"....", "####", "....", "...."}}, // I
-	{{".#..", ".###", "....", "...."}}, // T
-	{{".##.", ".##.", "....", "...."}}, // O
-	{{".##.", "##..", "....", "...."}}, // S
-	{{"##..", ".##.", "....", "...."}}, // Z
-	{{"#...", "###.", "....", "...."}}, // J
-	{{"..#.", "###.", "....", "...."}}, // L
-}};
+#define T(key) obs_module_text(key)
 
-static const std::array<uint32_t, 7> Colors = {
-	0x25d6ffff, 0xa855f7ff, 0xfacc15ff, 0x22c55eff, 0xef4444ff, 0x3b82f6ff, 0xf97316ff,
+/* Source id and the first hotkey names are kept from 1.x so existing scenes and bindings survive */
+constexpr const char *SourceId = "obs_tetris_source";
+
+struct HotkeyDef {
+	sp::Action action;
+	const char *name;
+	const char *label;
 };
 
-struct Piece {
-	int type = 0;
-	int rot = 0;
-	int x = 3;
-	int y = -1;
+const HotkeyDef Hotkeys[] = {
+	{sp::Action::Left, "obs_tetris.left", "Hotkey.Left"},
+	{sp::Action::Right, "obs_tetris.right", "Hotkey.Right"},
+	{sp::Action::SoftDrop, "obs_tetris.down", "Hotkey.SoftDrop"},
+	{sp::Action::RotateCW, "obs_tetris.rotate", "Hotkey.Rotate"},
+	{sp::Action::RotateCCW, "obs_tetris.rotate_ccw", "Hotkey.RotateCCW"},
+	{sp::Action::HardDrop, "obs_tetris.drop", "Hotkey.HardDrop"},
+	{sp::Action::Hold, "obs_tetris.hold", "Hotkey.Hold"},
+	{sp::Action::Pause, "obs_tetris.pause", "Hotkey.Pause"},
+	{sp::Action::Reset, "obs_tetris.reset", "Hotkey.Reset"},
+	{sp::Action::Autopilot, "obs_tetris.autopilot", "Hotkey.Autopilot"},
+	{sp::Action::Panic, "obs_tetris.panic", "Hotkey.Panic"},
+	{sp::Action::ToggleChat, "obs_tetris.chat_toggle", "Hotkey.ChatToggle"},
 };
 
-struct TetrisSource {
+struct Inbox {
+	std::mutex lock;
+	std::vector<sp::InboxMsg> items;
+
+	void push(sp::InboxMsg &&msg)
+	{
+		std::lock_guard<std::mutex> guard(lock);
+		if (items.size() < 512)
+			items.push_back(std::move(msg));
+	}
+
+	std::vector<sp::InboxMsg> take()
+	{
+		std::vector<sp::InboxMsg> out;
+		std::lock_guard<std::mutex> guard(lock);
+		out.swap(items);
+		return out;
+	}
+};
+
+struct StackSource {
 	obs_source_t *source = nullptr;
+	std::mutex lock; /* guards game + size */
+	sp::Game game;
+	sp::Batch batch; /* graphics thread only */
 	uint32_t width = 720;
 	uint32_t height = 1080;
-	float fallSeconds = 0.65f;
-	bool showGrid = true;
-	bool paused = false;
-	bool gameOver = false;
-	int score = 0;
-	int lines = 0;
-	int level = 1;
-	float fallAccum = 0.0f;
-	float inputAccum = 0.0f;
-	float elapsedSeconds = 0.0f;
-	std::array<uint32_t, BoardW * BoardH> board{};
-	Piece current;
-	Piece next;
-	std::mt19937 rng{std::random_device{}()};
-	std::mutex lock;
-	obs_hotkey_id leftHotkey = OBS_INVALID_HOTKEY_ID;
-	obs_hotkey_id rightHotkey = OBS_INVALID_HOTKEY_ID;
-	obs_hotkey_id downHotkey = OBS_INVALID_HOTKEY_ID;
-	obs_hotkey_id rotateHotkey = OBS_INVALID_HOTKEY_ID;
-	obs_hotkey_id dropHotkey = OBS_INVALID_HOTKEY_ID;
-	obs_hotkey_id pauseHotkey = OBS_INVALID_HOTKEY_ID;
-	obs_hotkey_id resetHotkey = OBS_INVALID_HOTKEY_ID;
+
+	std::shared_ptr<Inbox> inbox = std::make_shared<Inbox>();
+	std::unique_ptr<sp::TwitchChat> twitch;
+	std::unique_ptr<sp::HttpBridge> bridge;
+	std::string channel;
+	int bridgePort = 0;
+	std::string bridgeKey;
+
+	std::array<obs_hotkey_id, sp::ActionCount> hotkeys{};
+	std::array<bool, sp::ActionCount> keyHeld{};
 };
 
-static inline uint32_t rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255)
+std::string stateJson(StackSource *s)
 {
-	return (uint32_t(r) << 24) | (uint32_t(g) << 16) | (uint32_t(b) << 8) | uint32_t(a);
-}
-
-static inline bool pieceCell(const Piece &p, int px, int py)
-{
-	int x = px;
-	int y = py;
-	switch (p.rot & 3) {
-	case 1:
-		x = py;
-		y = PieceSize - 1 - px;
-		break;
-	case 2:
-		x = PieceSize - 1 - px;
-		y = PieceSize - 1 - py;
-		break;
-	case 3:
-		x = PieceSize - 1 - py;
-		y = px;
-		break;
-	default:
-		break;
-	}
-	return Pieces[p.type][y][x] == '#';
-}
-
-static bool collides(const TetrisSource *s, const Piece &p)
-{
-	for (int py = 0; py < PieceSize; ++py) {
-		for (int px = 0; px < PieceSize; ++px) {
-			if (!pieceCell(p, px, py))
-				continue;
-			const int bx = p.x + px;
-			const int by = p.y + py;
-			if (bx < 0 || bx >= BoardW || by >= BoardH)
-				return true;
-			if (by >= 0 && s->board[size_t(by * BoardW + bx)] != Empty)
-				return true;
-		}
-	}
-	return false;
-}
-
-static Piece randomPiece(TetrisSource *s)
-{
-	std::uniform_int_distribution<int> dist(0, 6);
-	Piece p;
-	p.type = dist(s->rng);
-	p.rot = 0;
-	p.x = 3;
-	p.y = -1;
-	return p;
-}
-
-static void resetGame(TetrisSource *s)
-{
-	s->board.fill(Empty);
-	s->score = 0;
-	s->lines = 0;
-	s->level = 1;
-	s->fallSeconds = 0.65f;
-	s->fallAccum = 0.0f;
-	s->elapsedSeconds = 0.0f;
-	s->paused = false;
-	s->gameOver = false;
-	s->current = randomPiece(s);
-	s->next = randomPiece(s);
-}
-
-static void spawnPiece(TetrisSource *s)
-{
-	s->current = s->next;
-	s->current.x = 3;
-	s->current.y = -1;
-	s->current.rot = 0;
-	s->next = randomPiece(s);
-	if (collides(s, s->current))
-		s->gameOver = true;
-}
-
-static void clearLines(TetrisSource *s)
-{
-	int cleared = 0;
-	for (int y = BoardH - 1; y >= 0; --y) {
-		bool full = true;
-		for (int x = 0; x < BoardW; ++x)
-			full = full && s->board[size_t(y * BoardW + x)] != Empty;
-		if (!full)
-			continue;
-		++cleared;
-		for (int yy = y; yy > 0; --yy) {
-			for (int x = 0; x < BoardW; ++x)
-				s->board[size_t(yy * BoardW + x)] = s->board[size_t((yy - 1) * BoardW + x)];
-		}
-		for (int x = 0; x < BoardW; ++x)
-			s->board[size_t(x)] = Empty;
-		++y;
-	}
-	if (cleared > 0) {
-		static const int points[] = {0, 100, 300, 500, 800};
-		s->score += points[cleared] * s->level;
-		s->lines += cleared;
-		s->level = 1 + s->lines / 10;
-		s->fallSeconds = std::max(0.08f, 0.65f - float(s->level - 1) * 0.055f);
-	}
-}
-
-static void lockPiece(TetrisSource *s)
-{
-	for (int py = 0; py < PieceSize; ++py) {
-		for (int px = 0; px < PieceSize; ++px) {
-			if (!pieceCell(s->current, px, py))
-				continue;
-			const int bx = s->current.x + px;
-			const int by = s->current.y + py;
-			if (bx >= 0 && bx < BoardW && by >= 0 && by < BoardH)
-				s->board[size_t(by * BoardW + bx)] = Colors[s->current.type];
-		}
-	}
-	clearLines(s);
-	spawnPiece(s);
-}
-
-static bool tryMove(TetrisSource *s, int dx, int dy)
-{
-	if (s->paused || s->gameOver)
-		return false;
-	Piece moved = s->current;
-	moved.x += dx;
-	moved.y += dy;
-	if (collides(s, moved))
-		return false;
-	s->current = moved;
-	return true;
-}
-
-static void softDrop(TetrisSource *s)
-{
-	if (!tryMove(s, 0, 1) && !s->paused && !s->gameOver)
-		lockPiece(s);
-}
-
-static void rotatePiece(TetrisSource *s)
-{
-	if (s->paused || s->gameOver)
-		return;
-	Piece r = s->current;
-	r.rot = (r.rot + 1) & 3;
-	for (int kick : {0, -1, 1, -2, 2}) {
-		Piece test = r;
-		test.x += kick;
-		if (!collides(s, test)) {
-			s->current = test;
-			return;
-		}
-	}
-}
-
-static void hardDrop(TetrisSource *s)
-{
-	if (s->paused || s->gameOver)
-		return;
-	while (tryMove(s, 0, 1))
-		s->score += 2;
-	lockPiece(s);
-}
-
-static void drawRect(float x, float y, float w, float h, uint32_t color)
-{
-	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_SOLID);
-	if (!effect)
-		return;
-
-	vec4 c = {};
-	c.x = float((color >> 24) & 0xff) / 255.0f;
-	c.y = float((color >> 16) & 0xff) / 255.0f;
-	c.z = float((color >> 8) & 0xff) / 255.0f;
-	c.w = float(color & 0xff) / 255.0f;
-	gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "color"), &c);
-
-	gs_matrix_push();
-	gs_matrix_translate3f(x, y, 0.0f);
-	while (gs_effect_loop(effect, "Solid"))
-		gs_draw_sprite(nullptr, 0, uint32_t(w), uint32_t(h));
-	gs_matrix_pop();
-}
-
-static void drawCell(float x, float y, float size, uint32_t color)
-{
-	drawRect(x, y, size, size, rgba(15, 23, 42, 235));
-	drawRect(x + 2.0f, y + 2.0f, size - 4.0f, size - 4.0f, color);
-	drawRect(x + 5.0f, y + 5.0f, size - 10.0f, std::max(2.0f, size * 0.16f), rgba(255, 255, 255, 54));
-}
-
-
-static const uint8_t *glyphRows(char c)
-{
-	static const uint8_t space[7] = {0, 0, 0, 0, 0, 0, 0};
-	static const uint8_t colon[7] = {0, 4, 4, 0, 4, 4, 0};
-	static const uint8_t dash[7] = {0, 0, 0, 31, 0, 0, 0};
-	static const uint8_t zero[7] = {14, 17, 19, 21, 25, 17, 14};
-	static const uint8_t one[7] = {4, 12, 4, 4, 4, 4, 14};
-	static const uint8_t two[7] = {14, 17, 1, 2, 4, 8, 31};
-	static const uint8_t three[7] = {30, 1, 1, 14, 1, 1, 30};
-	static const uint8_t four[7] = {2, 6, 10, 18, 31, 2, 2};
-	static const uint8_t five[7] = {31, 16, 16, 30, 1, 1, 30};
-	static const uint8_t six[7] = {14, 16, 16, 30, 17, 17, 14};
-	static const uint8_t seven[7] = {31, 1, 2, 4, 8, 8, 8};
-	static const uint8_t eight[7] = {14, 17, 17, 14, 17, 17, 14};
-	static const uint8_t nine[7] = {14, 17, 17, 15, 1, 1, 14};
-	static const uint8_t a[7] = {14, 17, 17, 31, 17, 17, 17};
-	static const uint8_t c_[7] = {14, 17, 16, 16, 16, 17, 14};
-	static const uint8_t e[7] = {31, 16, 16, 30, 16, 16, 31};
-	static const uint8_t g[7] = {14, 17, 16, 23, 17, 17, 15};
-	static const uint8_t i[7] = {14, 4, 4, 4, 4, 4, 14};
-	static const uint8_t l[7] = {16, 16, 16, 16, 16, 16, 31};
-	static const uint8_t m[7] = {17, 27, 21, 21, 17, 17, 17};
-	static const uint8_t n[7] = {17, 25, 21, 19, 17, 17, 17};
-	static const uint8_t o[7] = {14, 17, 17, 17, 17, 17, 14};
-	static const uint8_t p[7] = {30, 17, 17, 30, 16, 16, 16};
-	static const uint8_t r[7] = {30, 17, 17, 30, 20, 18, 17};
-	static const uint8_t s_[7] = {15, 16, 16, 14, 1, 1, 30};
-	static const uint8_t t[7] = {31, 4, 4, 4, 4, 4, 4};
-	static const uint8_t u[7] = {17, 17, 17, 17, 17, 17, 14};
-	static const uint8_t v[7] = {17, 17, 17, 17, 17, 10, 4};
-
-	switch (c) {
-	case '0': return zero; case '1': return one; case '2': return two; case '3': return three; case '4': return four;
-	case '5': return five; case '6': return six; case '7': return seven; case '8': return eight; case '9': return nine;
-	case ':': return colon; case '-': return dash; case 'A': return a; case 'C': return c_; case 'E': return e;
-	case 'G': return g; case 'I': return i; case 'L': return l; case 'M': return m; case 'N': return n;
-	case 'O': return o; case 'P': return p; case 'R': return r; case 'S': return s_; case 'T': return t;
-	case 'U': return u; case 'V': return v; default: return space;
-	}
-}
-
-static float textWidth(const char *text, float scale)
-{
-	float width = 0.0f;
-	for (const char *p = text; *p; ++p)
-		width += (*p == ' ') ? 4.0f * scale : 6.0f * scale;
-	return width;
-}
-
-static void drawText(const char *text, float x, float y, float scale, uint32_t color)
-{
-	float cx = x;
-	for (const char *p = text; *p; ++p) {
-		if (*p == ' ') {
-			cx += 4.0f * scale;
-			continue;
-		}
-		const uint8_t *rows = glyphRows(*p);
-		for (int row = 0; row < 7; ++row) {
-			for (int col = 0; col < 5; ++col) {
-				if (rows[row] & (1 << (4 - col)))
-					drawRect(cx + float(col) * scale, y + float(row) * scale, scale, scale, color);
-			}
-		}
-		cx += 6.0f * scale;
-	}
-}
-
-static void drawTextCentered(const char *text, float cx, float y, float scale, uint32_t color)
-{
-	drawText(text, cx - textWidth(text, scale) * 0.5f, y, scale, color);
-}
-
-static std::string formatTime(float seconds)
-{
-	const int total = std::max(0, int(seconds));
-	const int minutes = total / 60;
-	const int secs = total % 60;
-	char buffer[16];
-	std::snprintf(buffer, sizeof(buffer), "%02d:%02d", minutes, secs);
-	return std::string(buffer);
-}
-
-static void drawHudLine(const char *label, const std::string &value, float x, float y, float w, float scale)
-{
-	drawText(label, x, y, scale, rgba(148, 163, 184, 255));
-	drawText(value.c_str(), x, y + scale * 9.0f, scale * 1.28f, rgba(248, 250, 252, 255));
-	drawRect(x, y + scale * 18.5f, w, 1.0f, rgba(51, 65, 85, 255));
-}
-
-static void withSourceLock(void *data, const std::function<void(TetrisSource *)> &fn)
-{
-	auto *src = static_cast<TetrisSource *>(data);
-	std::lock_guard<std::mutex> guard(src->lock);
-	fn(src);
-}
-
-static void hotkeyLeft(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		withSourceLock(data, [](TetrisSource *s) { tryMove(s, -1, 0); });
-}
-
-static void hotkeyRight(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		withSourceLock(data, [](TetrisSource *s) { tryMove(s, 1, 0); });
-}
-
-static void hotkeyDown(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		withSourceLock(data, [](TetrisSource *s) { softDrop(s); });
-}
-
-static void hotkeyRotate(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		withSourceLock(data, [](TetrisSource *s) { rotatePiece(s); });
-}
-
-static void hotkeyDrop(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		withSourceLock(data, [](TetrisSource *s) { hardDrop(s); });
-}
-
-static void hotkeyPause(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		withSourceLock(data, [](TetrisSource *s) { s->paused = !s->paused; });
-}
-
-static void hotkeyReset(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		withSourceLock(data, [](TetrisSource *s) { resetGame(s); });
-}
-
-static const char *tetris_get_name(void *)
-{
-	return obs_module_text("OBSTetrisSource");
-}
-
-static void tetris_update(void *data, obs_data_t *settings)
-{
-	auto *s = static_cast<TetrisSource *>(data);
 	std::lock_guard<std::mutex> guard(s->lock);
-	s->width = uint32_t(obs_data_get_int(settings, "width"));
-	s->height = uint32_t(obs_data_get_int(settings, "height"));
-	s->showGrid = obs_data_get_bool(settings, "show_grid");
+	const sp::Game &g = s->game;
+	static const char *const fxNames[sp::FX_COUNT] = {"flip",  "mirror", "turbo", "slow", "dark",
+							  "shake", "wobble", "disco", "hype", "chill"};
+	static const char *const modes[3] = {"off", "anarchy", "democracy"};
+	std::string j = "{";
+	j += "\"score\":" + std::to_string(g.score);
+	j += ",\"best\":" + std::to_string(std::max(g.best, g.score));
+	j += ",\"lines\":" + std::to_string(g.lines);
+	j += ",\"level\":" + std::to_string(g.level);
+	j += std::string(",\"gameOver\":") + (g.gameOver ? "true" : "false");
+	j += std::string(",\"paused\":") + (g.paused ? "true" : "false");
+	j += std::string(",\"autopilot\":") + (g.autopilot ? "true" : "false");
+	j += std::string(",\"chatPlays\":\"") + modes[int(g.cfg.chatPlays)] + "\"";
+	j += ",\"shields\":" + std::to_string(g.shields);
+	j += ",\"hype\":" + std::to_string(int(g.hype * 100.0f));
+	j += ",\"chaos\":" + std::to_string(g.chaos);
+	j += ",\"chaosThreshold\":" + std::to_string(g.cfg.chaosThreshold);
+	j += ",\"effects\":[";
+	bool first = true;
+	for (int e = 0; e < sp::FX_COUNT; ++e) {
+		if (!g.fxActive(e))
+			continue;
+		j += std::string(first ? "" : ",") + "{\"name\":\"" + fxNames[e] +
+		     "\",\"seconds\":" + std::to_string(int(g.fxRemaining(e) + 0.5f)) + "}";
+		first = false;
+	}
+	auto ranks = [](const std::vector<sp::RankEntry> &list) {
+		std::string out = "[";
+		for (size_t i = 0; i < list.size(); ++i)
+			out += std::string(i ? "," : "") + "{\"name\":\"" + list[i].name +
+			       "\",\"points\":" + std::to_string(list[i].points) + "}";
+		return out + "]";
+	};
+	j += "],\"topHelpers\":" + ranks(g.topHelpers);
+	j += ",\"topTrolls\":" + ranks(g.topTrolls);
+	j += "}";
+	return j;
 }
 
-static void *tetris_create(obs_data_t *settings, obs_source_t *source)
-{
-	auto *s = new TetrisSource();
-	s->source = source;
-	tetris_update(s, settings);
-	resetGame(s);
+/* ------------------------------------------------------------------ */
+/* Input                                                               */
+/* ------------------------------------------------------------------ */
 
-	s->leftHotkey = obs_hotkey_register_source(source, "obs_tetris.left", "Tetris: Move Left", hotkeyLeft, s);
-	s->rightHotkey = obs_hotkey_register_source(source, "obs_tetris.right", "Tetris: Move Right", hotkeyRight, s);
-	s->downHotkey = obs_hotkey_register_source(source, "obs_tetris.down", "Tetris: Soft Drop", hotkeyDown, s);
-	s->rotateHotkey = obs_hotkey_register_source(source, "obs_tetris.rotate", "Tetris: Rotate", hotkeyRotate, s);
-	s->dropHotkey = obs_hotkey_register_source(source, "obs_tetris.drop", "Tetris: Hard Drop", hotkeyDrop, s);
-	s->pauseHotkey = obs_hotkey_register_source(source, "obs_tetris.pause", "Tetris: Pause", hotkeyPause, s);
-	s->resetHotkey = obs_hotkey_register_source(source, "obs_tetris.reset", "Tetris: Reset", hotkeyReset, s);
+void onHotkey(void *data, obs_hotkey_id id, obs_hotkey_t *, bool pressed)
+{
+	auto *s = static_cast<StackSource *>(data);
+	std::lock_guard<std::mutex> guard(s->lock);
+	for (size_t i = 0; i < s->hotkeys.size(); ++i) {
+		if (s->hotkeys[i] == id) {
+			s->game.press(static_cast<sp::Action>(i), pressed);
+			break;
+		}
+	}
+}
+
+int actionForKey(obs_key_t key)
+{
+	switch (key) {
+	case OBS_KEY_LEFT:
+	case OBS_KEY_A:
+		return int(sp::Action::Left);
+	case OBS_KEY_RIGHT:
+	case OBS_KEY_D:
+		return int(sp::Action::Right);
+	case OBS_KEY_DOWN:
+	case OBS_KEY_S:
+		return int(sp::Action::SoftDrop);
+	case OBS_KEY_UP:
+	case OBS_KEY_W:
+	case OBS_KEY_X:
+		return int(sp::Action::RotateCW);
+	case OBS_KEY_Z:
+	case OBS_KEY_Q:
+		return int(sp::Action::RotateCCW);
+	case OBS_KEY_SPACE:
+		return int(sp::Action::HardDrop);
+	case OBS_KEY_C:
+	case OBS_KEY_SHIFT:
+		return int(sp::Action::Hold);
+	case OBS_KEY_P:
+	case OBS_KEY_ESCAPE:
+		return int(sp::Action::Pause);
+	default:
+		return -1;
+	}
+}
+
+/* Keyboard play through OBS' "Interact" window, no global hotkeys needed */
+void onKey(void *data, const obs_key_event *event, bool keyUp)
+{
+	auto *s = static_cast<StackSource *>(data);
+	const int action = actionForKey(obs_key_from_virtual_key(int(event->native_vkey)));
+	if (action < 0)
+		return;
+	std::lock_guard<std::mutex> guard(s->lock);
+	bool &held = s->keyHeld[size_t(action)];
+	if (!keyUp && held)
+		return; /* ignore OS auto-repeat, the game has its own */
+	held = !keyUp;
+	s->game.press(static_cast<sp::Action>(action), !keyUp);
+}
+
+void onFocus(void *data, bool focus)
+{
+	if (focus)
+		return;
+	auto *s = static_cast<StackSource *>(data);
+	std::lock_guard<std::mutex> guard(s->lock);
+	for (size_t i = 0; i < s->keyHeld.size(); ++i) {
+		if (s->keyHeld[i])
+			s->game.press(static_cast<sp::Action>(i), false);
+		s->keyHeld[i] = false;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Source callbacks                                                    */
+/* ------------------------------------------------------------------ */
+
+const char *sourceName(void *)
+{
+	return T("Source.Name");
+}
+
+void sourceUpdate(void *data, obs_data_t *settings)
+{
+	auto *s = static_cast<StackSource *>(data);
+
+	sp::Settings cfg;
+	cfg.theme = int(obs_data_get_int(settings, "theme"));
+	cfg.showGrid = obs_data_get_bool(settings, "show_grid");
+	cfg.showGhost = obs_data_get_bool(settings, "show_ghost");
+	cfg.transparent = obs_data_get_bool(settings, "transparent");
+	cfg.showPanels = obs_data_get_bool(settings, "show_panels");
+	cfg.startLevel = int(obs_data_get_int(settings, "start_level"));
+	cfg.autoRestart = float(obs_data_get_int(settings, "auto_restart"));
+	cfg.autopilotIdle = float(obs_data_get_int(settings, "autopilot_idle"));
+	cfg.effectScale = float(obs_data_get_int(settings, "effect_scale")) / 100.0f;
+	cfg.chatEnabled = obs_data_get_bool(settings, "chat_enabled");
+	cfg.prefix = obs_data_get_string(settings, "prefix");
+	cfg.userCooldown = float(obs_data_get_int(settings, "user_cooldown"));
+	cfg.globalCooldown = float(obs_data_get_int(settings, "global_cooldown"));
+	cfg.privilegedBypass = obs_data_get_bool(settings, "mods_bypass");
+	cfg.allowTroll = obs_data_get_bool(settings, "allow_troll");
+	cfg.allowHelper = obs_data_get_bool(settings, "allow_helper");
+	cfg.allowFun = obs_data_get_bool(settings, "allow_fun");
+	cfg.plainReactions = obs_data_get_bool(settings, "plain_reactions");
+	cfg.welcomeFirst = obs_data_get_bool(settings, "welcome_first");
+	cfg.bitsThreshold = int(obs_data_get_int(settings, "bits_threshold"));
+	cfg.chaosThreshold = int(obs_data_get_int(settings, "chaos_threshold"));
+	cfg.chatPlays = static_cast<sp::ChatPlaysMode>(std::clamp(int(obs_data_get_int(settings, "chat_plays")), 0, 2));
+	cfg.voteSeconds = float(obs_data_get_int(settings, "vote_seconds"));
+
+	{
+		std::lock_guard<std::mutex> guard(s->lock);
+		s->width = uint32_t(std::max<long long>(64, obs_data_get_int(settings, "width")));
+		s->height = uint32_t(std::max<long long>(64, obs_data_get_int(settings, "height")));
+		s->game.configure(cfg);
+	}
+
+	const std::string channel =
+		cfg.chatEnabled ? sp::normalizeChannel(obs_data_get_string(settings, "twitch_channel")) : std::string();
+	if (channel != s->channel) {
+		s->channel = channel;
+		s->twitch->start(channel); /* empty channel just stops */
+	}
+
+	const bool bridgeOn = obs_data_get_bool(settings, "bridge_enabled");
+	const int port = bridgeOn ? int(obs_data_get_int(settings, "bridge_port")) : 0;
+	const std::string key = obs_data_get_string(settings, "bridge_key");
+	if (port != s->bridgePort || key != s->bridgeKey) {
+		s->bridgePort = port;
+		s->bridgeKey = key;
+		if (port > 0)
+			s->bridge->start(port, key);
+		else
+			s->bridge->stop();
+	}
+}
+
+void *sourceCreate(obs_data_t *settings, obs_source_t *source)
+{
+	auto *s = new StackSource();
+	s->source = source;
+	std::weak_ptr<Inbox> inbox = s->inbox;
+	auto sink = [inbox](sp::InboxMsg &&msg) {
+		if (auto box = inbox.lock())
+			box->push(std::move(msg));
+	};
+	s->twitch = std::make_unique<sp::TwitchChat>(sink);
+	s->bridge = std::make_unique<sp::HttpBridge>(sink, [s]() { return stateJson(s); });
+
+	s->game.best = obs_data_get_int(settings, "best_score");
+	sourceUpdate(s, settings);
+	{
+		std::lock_guard<std::mutex> guard(s->lock);
+		s->game.reset();
+		s->game.gamesPlayed = 0;
+	}
+
+	s->hotkeys.fill(OBS_INVALID_HOTKEY_ID);
+	for (const HotkeyDef &h : Hotkeys)
+		s->hotkeys[size_t(h.action)] = obs_hotkey_register_source(source, h.name, T(h.label), onHotkey, s);
 	return s;
 }
 
-static void tetris_destroy(void *data)
+void sourceDestroy(void *data)
 {
-	delete static_cast<TetrisSource *>(data);
+	auto *s = static_cast<StackSource *>(data);
+	s->twitch->stop();
+	s->bridge->stop();
+	obs_enter_graphics();
+	s->batch.release();
+	obs_leave_graphics();
+	delete s;
 }
 
-static void tetris_defaults(obs_data_t *settings)
+void sourceSave(void *data, obs_data_t *settings)
+{
+	auto *s = static_cast<StackSource *>(data);
+	std::lock_guard<std::mutex> guard(s->lock);
+	obs_data_set_int(settings, "best_score", std::max(s->game.best, s->game.score));
+}
+
+void sourceDefaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "width", 720);
 	obs_data_set_default_int(settings, "height", 1080);
+	obs_data_set_default_int(settings, "theme", 0);
 	obs_data_set_default_bool(settings, "show_grid", true);
+	obs_data_set_default_bool(settings, "show_ghost", true);
+	obs_data_set_default_bool(settings, "transparent", false);
+	obs_data_set_default_bool(settings, "show_panels", true);
+	obs_data_set_default_int(settings, "start_level", 1);
+	obs_data_set_default_int(settings, "auto_restart", 8);
+	obs_data_set_default_int(settings, "autopilot_idle", 0);
+	obs_data_set_default_int(settings, "effect_scale", 100);
+
+	obs_data_set_default_bool(settings, "chat_enabled", true);
+	obs_data_set_default_string(settings, "twitch_channel", "");
+	obs_data_set_default_string(settings, "prefix", "!");
+	obs_data_set_default_int(settings, "user_cooldown", 10);
+	obs_data_set_default_int(settings, "global_cooldown", 20);
+	obs_data_set_default_bool(settings, "mods_bypass", true);
+	obs_data_set_default_bool(settings, "allow_troll", true);
+	obs_data_set_default_bool(settings, "allow_helper", true);
+	obs_data_set_default_bool(settings, "allow_fun", true);
+	obs_data_set_default_bool(settings, "plain_reactions", true);
+	obs_data_set_default_bool(settings, "welcome_first", true);
+	obs_data_set_default_int(settings, "bits_threshold", 100);
+	obs_data_set_default_int(settings, "chaos_threshold", 30);
+	obs_data_set_default_int(settings, "chat_plays", 0);
+	obs_data_set_default_int(settings, "vote_seconds", 4);
+
+	obs_data_set_default_bool(settings, "bridge_enabled", false);
+	obs_data_set_default_int(settings, "bridge_port", 8911);
+	obs_data_set_default_string(settings, "bridge_key", "");
 }
 
-static obs_properties_t *tetris_properties(void *)
+/* ------------------------------------------------------------------ */
+/* Properties                                                          */
+/* ------------------------------------------------------------------ */
+
+void inject(void *data, sp::InboxMsg &&msg)
 {
+	auto *s = static_cast<StackSource *>(data);
+	if (s)
+		s->inbox->push(std::move(msg));
+}
+
+sp::InboxMsg testMsg(sp::InboxMsg::Kind kind, int amount, const std::string &text = std::string())
+{
+	sp::InboxMsg m;
+	m.kind = kind;
+	m.user = "TestViewer";
+	m.amount = amount;
+	m.text = text;
+	return m;
+}
+
+bool testSub(obs_properties_t *, obs_property_t *, void *data)
+{
+	inject(data, testMsg(sp::InboxMsg::Sub, 3));
+	return false;
+}
+
+bool testGiftBomb(obs_properties_t *, obs_property_t *, void *data)
+{
+	inject(data, testMsg(sp::InboxMsg::MysteryGift, 5));
+	return false;
+}
+
+bool testRaid(obs_properties_t *, obs_property_t *, void *data)
+{
+	inject(data, testMsg(sp::InboxMsg::Raid, 42));
+	return false;
+}
+
+bool testBits(obs_properties_t *, obs_property_t *, void *data)
+{
+	inject(data, testMsg(sp::InboxMsg::Bits, 300, "Cheer300"));
+	return false;
+}
+
+bool testChat(obs_properties_t *, obs_property_t *, void *data)
+{
+	static const char *const commands[] = {"flip",   "mirror", "turbo", "garbage", "dark", "shake",
+					       "wobble", "curse",  "slow",  "bomb",    "long", "shield",
+					       "disco",  "gg",     "pog",   "hype",    "lol"};
+	static std::mt19937 rng(std::random_device{}());
+	const size_t count = sizeof(commands) / sizeof(commands[0]);
+	sp::InboxMsg m = testMsg(sp::InboxMsg::Chat, 0);
+	m.command = commands[std::uniform_int_distribution<size_t>(0, count - 1)(rng)];
+	m.bypassCooldown = true;
+	inject(data, std::move(m));
+	return false;
+}
+
+bool testWheel(obs_properties_t *, obs_property_t *, void *data)
+{
+	auto *s = static_cast<StackSource *>(data);
+	if (!s)
+		return false;
+	std::lock_guard<std::mutex> guard(s->lock);
+	s->game.spin("TESTVIEWER");
+	return false;
+}
+
+bool panicButton(obs_properties_t *, obs_property_t *, void *data)
+{
+	auto *s = static_cast<StackSource *>(data);
+	if (!s)
+		return false;
+	std::lock_guard<std::mutex> guard(s->lock);
+	s->game.panic();
+	return false;
+}
+
+bool refreshStatus(obs_properties_t *, obs_property_t *, void *)
+{
+	return true;
+}
+
+obs_properties_t *sourceProperties(void *data)
+{
+	auto *s = static_cast<StackSource *>(data);
 	obs_properties_t *props = obs_properties_create();
-	obs_properties_add_int(props, "width", "Width", 320, 3840, 10);
-	obs_properties_add_int(props, "height", "Height", 480, 2160, 10);
-	obs_properties_add_bool(props, "show_grid", "Show subtle grid");
+
+	/* Look & feel */
+	obs_properties_t *look = obs_properties_create();
+	obs_properties_add_int(look, "width", T("Width"), 320, 7680, 10);
+	obs_properties_add_int(look, "height", T("Height"), 240, 4320, 10);
+	obs_property_t *theme =
+		obs_properties_add_list(look, "theme", T("Theme"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	for (int i = 0; i < sp::themeCount(); ++i)
+		obs_property_list_add_int(theme, sp::themeName(i), i);
+	obs_properties_add_bool(look, "transparent", T("Transparent"));
+	obs_properties_add_bool(look, "show_panels", T("ShowPanels"));
+	obs_properties_add_bool(look, "show_grid", T("ShowGrid"));
+	obs_properties_add_bool(look, "show_ghost", T("ShowGhost"));
+	obs_properties_add_group(props, "group_look", T("Group.Look"), OBS_GROUP_NORMAL, look);
+
+	/* Gameplay */
+	obs_properties_t *play = obs_properties_create();
+	obs_properties_add_int_slider(play, "start_level", T("StartLevel"), 1, 20, 1);
+	obs_property_t *restart = obs_properties_add_int(play, "auto_restart", T("AutoRestart"), 0, 120, 1);
+	obs_property_int_set_suffix(restart, " s");
+	obs_property_t *idle = obs_properties_add_int(play, "autopilot_idle", T("AutopilotIdle"), 0, 3600, 5);
+	obs_property_int_set_suffix(idle, " s");
+	obs_property_set_long_description(idle, T("AutopilotIdle.Help"));
+	obs_property_t *scale = obs_properties_add_int_slider(play, "effect_scale", T("EffectScale"), 25, 300, 25);
+	obs_property_int_set_suffix(scale, " %");
+	obs_properties_add_group(props, "group_play", T("Group.Gameplay"), OBS_GROUP_NORMAL, play);
+
+	/* Chat */
+	obs_properties_t *chat = obs_properties_create();
+	std::string status = T("Status.Off");
+	if (s) {
+		bool connected = false;
+		const std::string tw = s->twitch->status(&connected);
+		const std::string br = s->bridge->status();
+		if (!tw.empty() || !br.empty())
+			status = tw + (tw.empty() || br.empty() ? "" : "  |  ") + br;
+	}
+	obs_properties_add_text(chat, "chat_status", status.c_str(), OBS_TEXT_INFO);
+	obs_properties_add_button2(chat, "refresh_status", T("RefreshStatus"), refreshStatus, s);
+	obs_properties_add_bool(chat, "chat_enabled", T("ChatEnabled"));
+	obs_property_t *channel = obs_properties_add_text(chat, "twitch_channel", T("TwitchChannel"), OBS_TEXT_DEFAULT);
+	obs_property_set_long_description(channel, T("TwitchChannel.Help"));
+	obs_properties_add_text(chat, "prefix", T("Prefix"), OBS_TEXT_DEFAULT);
+	obs_properties_add_bool(chat, "allow_troll", T("AllowTroll"));
+	obs_properties_add_bool(chat, "allow_helper", T("AllowHelper"));
+	obs_properties_add_bool(chat, "allow_fun", T("AllowFun"));
+	obs_properties_add_bool(chat, "plain_reactions", T("PlainReactions"));
+	obs_properties_add_bool(chat, "welcome_first", T("WelcomeFirst"));
+	obs_property_t *ucd = obs_properties_add_int(chat, "user_cooldown", T("UserCooldown"), 0, 600, 1);
+	obs_property_int_set_suffix(ucd, " s");
+	obs_property_t *gcd = obs_properties_add_int(chat, "global_cooldown", T("GlobalCooldown"), 0, 600, 1);
+	obs_property_int_set_suffix(gcd, " s");
+	obs_properties_add_bool(chat, "mods_bypass", T("ModsBypass"));
+	obs_property_t *bits = obs_properties_add_int(chat, "bits_threshold", T("BitsThreshold"), 0, 100000, 50);
+	obs_property_set_long_description(bits, T("BitsThreshold.Help"));
+	obs_property_t *chaos = obs_properties_add_int(chat, "chaos_threshold", T("ChaosThreshold"), 0, 1000, 1);
+	obs_property_set_long_description(chaos, T("ChaosThreshold.Help"));
+	obs_properties_add_group(props, "group_chat", T("Group.Chat"), OBS_GROUP_NORMAL, chat);
+
+	/* Chat plays */
+	obs_properties_t *cp = obs_properties_create();
+	obs_property_t *mode =
+		obs_properties_add_list(cp, "chat_plays", T("ChatPlays"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(mode, T("ChatPlays.Off"), 0);
+	obs_property_list_add_int(mode, T("ChatPlays.Anarchy"), 1);
+	obs_property_list_add_int(mode, T("ChatPlays.Democracy"), 2);
+	obs_property_t *vote = obs_properties_add_int_slider(cp, "vote_seconds", T("VoteSeconds"), 1, 30, 1);
+	obs_property_int_set_suffix(vote, " s");
+	obs_properties_add_group(props, "group_chatplays", T("Group.ChatPlays"), OBS_GROUP_NORMAL, cp);
+
+	/* Bridge */
+	obs_properties_t *br = obs_properties_create();
+	obs_property_t *bon = obs_properties_add_bool(br, "bridge_enabled", T("BridgeEnabled"));
+	obs_property_set_long_description(bon, T("BridgeEnabled.Help"));
+	obs_properties_add_int(br, "bridge_port", T("BridgePort"), 1024, 65535, 1);
+	obs_properties_add_text(br, "bridge_key", T("BridgeKey"), OBS_TEXT_PASSWORD);
+	obs_properties_add_group(props, "group_bridge", T("Group.Bridge"), OBS_GROUP_NORMAL, br);
+
+	/* Test buttons */
+	obs_properties_t *test = obs_properties_create();
+	obs_properties_add_button2(test, "test_chat", T("Test.Chat"), testChat, s);
+	obs_properties_add_button2(test, "test_sub", T("Test.Sub"), testSub, s);
+	obs_properties_add_button2(test, "test_giftbomb", T("Test.GiftBomb"), testGiftBomb, s);
+	obs_properties_add_button2(test, "test_bits", T("Test.Bits"), testBits, s);
+	obs_properties_add_button2(test, "test_raid", T("Test.Raid"), testRaid, s);
+	obs_properties_add_button2(test, "test_wheel", T("Test.Wheel"), testWheel, s);
+	obs_properties_add_button2(test, "panic", T("Test.Panic"), panicButton, s);
+	obs_properties_add_group(props, "group_test", T("Group.Test"), OBS_GROUP_NORMAL, test);
+
 	return props;
 }
 
-static uint32_t tetris_width(void *data)
+uint32_t sourceWidth(void *data)
 {
-	return static_cast<TetrisSource *>(data)->width;
-}
-
-static uint32_t tetris_height(void *data)
-{
-	return static_cast<TetrisSource *>(data)->height;
-}
-
-static void tetris_tick(void *data, float seconds)
-{
-	auto *s = static_cast<TetrisSource *>(data);
+	auto *s = static_cast<StackSource *>(data);
 	std::lock_guard<std::mutex> guard(s->lock);
-	if (s->paused || s->gameOver)
-		return;
-	s->elapsedSeconds += seconds;
-	s->fallAccum += seconds;
-	if (s->fallAccum >= s->fallSeconds) {
-		s->fallAccum = 0.0f;
-		softDrop(s);
-	}
+	return s->width;
 }
 
-static void drawMiniPiece(const Piece &p, float ox, float oy, float cell)
+uint32_t sourceHeight(void *data)
 {
-	for (int py = 0; py < PieceSize; ++py) {
-		for (int px = 0; px < PieceSize; ++px) {
-			if (pieceCell(p, px, py))
-				drawCell(ox + float(px) * cell, oy + float(py) * cell, cell, Colors[p.type]);
-		}
-	}
-}
-
-static void tetris_render(void *data, gs_effect_t *)
-{
-	auto *s = static_cast<TetrisSource *>(data);
+	auto *s = static_cast<StackSource *>(data);
 	std::lock_guard<std::mutex> guard(s->lock);
-
-	const float w = float(s->width);
-	const float h = float(s->height);
-	drawRect(0, 0, w, h, rgba(2, 6, 23, 255));
-
-	const float margin = std::max(16.0f, w * 0.035f);
-	const float hudW = std::clamp(w * 0.25f, 150.0f, 250.0f);
-	const float nextW = std::clamp(w * 0.18f, 110.0f, 190.0f);
-	const float boardMaxW = w - margin * 4.0f - hudW - nextW;
-	const float boardMaxH = h - margin * 2.0f;
-	const float cell = std::floor(std::max(8.0f, std::min(boardMaxW / BoardW, boardMaxH / BoardH)));
-	const float boardW = cell * BoardW;
-	const float boardH = cell * BoardH;
-	const float by = (h - boardH) * 0.5f;
-	const float hudX = margin;
-	const float bx = hudX + hudW + margin;
-	const float nextX = bx + boardW + margin;
-
-	drawRect(hudX, by, hudW, boardH, rgba(15, 23, 42, 255));
-	drawRect(hudX + 8, by + 8, hudW - 16, boardH - 16, rgba(2, 6, 23, 130));
-	drawTextCentered("TETRIS", hudX + hudW * 0.5f, by + 24.0f, std::max(3.0f, hudW / 70.0f), rgba(34, 211, 238, 255));
-
-	const float hudScale = std::max(2.2f, hudW / 92.0f);
-	float lineY = by + 86.0f;
-	drawHudLine("SCORE", std::to_string(s->score), hudX + 22.0f, lineY, hudW - 44.0f, hudScale);
-	lineY += hudScale * 26.0f;
-	drawHudLine("TIME", formatTime(s->elapsedSeconds), hudX + 22.0f, lineY, hudW - 44.0f, hudScale);
-	lineY += hudScale * 26.0f;
-	drawHudLine("LEVEL", std::to_string(s->level), hudX + 22.0f, lineY, hudW - 44.0f, hudScale);
-	lineY += hudScale * 26.0f;
-	drawHudLine("LINES", std::to_string(s->lines), hudX + 22.0f, lineY, hudW - 44.0f, hudScale);
-
-	const float helpScale = std::max(1.6f, hudW / 130.0f);
-	float helpY = by + boardH - helpScale * 47.0f;
-	drawText("HOTKEYS", hudX + 22.0f, helpY, helpScale, rgba(148, 163, 184, 255));
-	drawText("MOVE", hudX + 22.0f, helpY + helpScale * 10.0f, helpScale, rgba(100, 116, 139, 255));
-	drawText("ROTATE", hudX + 22.0f, helpY + helpScale * 20.0f, helpScale, rgba(100, 116, 139, 255));
-	drawText("DROP", hudX + 22.0f, helpY + helpScale * 30.0f, helpScale, rgba(100, 116, 139, 255));
-
-	drawRect(bx - 8, by - 8, boardW + 16, boardH + 16, rgba(30, 41, 59, 255));
-	drawRect(bx, by, boardW, boardH, rgba(15, 23, 42, 255));
-
-	if (s->showGrid) {
-		for (int x = 1; x < BoardW; ++x)
-			drawRect(bx + float(x) * cell - 0.5f, by, 1.0f, boardH, rgba(148, 163, 184, 32));
-		for (int y = 1; y < BoardH; ++y)
-			drawRect(bx, by + float(y) * cell - 0.5f, boardW, 1.0f, rgba(148, 163, 184, 32));
-	}
-
-	for (int y = 0; y < BoardH; ++y) {
-		for (int x = 0; x < BoardW; ++x) {
-			const uint32_t color = s->board[size_t(y * BoardW + x)];
-			if (color != Empty)
-				drawCell(bx + float(x) * cell, by + float(y) * cell, cell, color);
-		}
-	}
-
-	for (int py = 0; py < PieceSize; ++py) {
-		for (int px = 0; px < PieceSize; ++px) {
-			if (!pieceCell(s->current, px, py))
-				continue;
-			const int x = s->current.x + px;
-			const int y = s->current.y + py;
-			if (y >= 0)
-				drawCell(bx + float(x) * cell, by + float(y) * cell, cell, Colors[s->current.type]);
-		}
-	}
-
-	drawRect(nextX, by, nextW, boardH, rgba(15, 23, 42, 255));
-	drawRect(nextX + 10, by + 10, nextW - 20, 150, rgba(30, 41, 59, 255));
-	drawTextCentered("NEXT", nextX + nextW * 0.5f, by + 28.0f, std::max(2.0f, nextW / 72.0f), rgba(148, 163, 184, 255));
-	drawMiniPiece(s->next, nextX + nextW * 0.5f - cell * 1.1f, by + 76.0f, std::max(14.0f, cell * 0.52f));
-
-	if (s->paused || s->gameOver) {
-		const char *title = s->gameOver ? "GAME OVER" : "PAUSED";
-		const char *subtitle = s->gameOver ? "RESET TO PLAY" : "PAUSE TO RESUME";
-		drawRect(bx, by + boardH * 0.36f, boardW, boardH * 0.26f, rgba(2, 6, 23, 224));
-		drawTextCentered(title, bx + boardW * 0.5f, by + boardH * 0.425f, std::max(3.0f, cell * 0.12f), s->gameOver ? rgba(248, 113, 113, 255) : rgba(250, 204, 21, 255));
-		drawTextCentered(subtitle, bx + boardW * 0.5f, by + boardH * 0.535f, std::max(2.0f, cell * 0.065f), rgba(226, 232, 240, 255));
-	}
+	return s->height;
 }
 
+void sourceTick(void *data, float seconds)
+{
+	auto *s = static_cast<StackSource *>(data);
+	std::vector<sp::InboxMsg> messages = s->inbox->take();
 
-static obs_source_info tetris_source_info = {};
+	bool connected = false;
+	std::string status = s->twitch->status(&connected);
+	if (status.empty())
+		status = s->bridge->status();
+
+	std::lock_guard<std::mutex> guard(s->lock);
+	for (const sp::InboxMsg &msg : messages)
+		s->game.handle(msg);
+	s->game.chatStatus = status;
+	s->game.chatConnected = connected || (!status.empty() && status.compare(0, 6, "BRIDGE") == 0 &&
+					      status.find("BUSY") == std::string::npos);
+	s->game.tick(seconds);
 }
+
+void sourceRender(void *data, gs_effect_t *)
+{
+	auto *s = static_cast<StackSource *>(data);
+	{
+		std::lock_guard<std::mutex> guard(s->lock);
+		s->batch.begin();
+		sp::renderGame(s->batch, s->game, float(s->width), float(s->height));
+	}
+	s->batch.draw();
+}
+
+obs_source_info makeSourceInfo()
+{
+	obs_source_info info = {};
+	info.id = SourceId;
+	info.type = OBS_SOURCE_TYPE_INPUT;
+	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_INTERACTION;
+	info.icon_type = OBS_ICON_TYPE_GAME_CAPTURE;
+	info.get_name = sourceName;
+	info.create = sourceCreate;
+	info.destroy = sourceDestroy;
+	info.update = sourceUpdate;
+	info.get_defaults = sourceDefaults;
+	info.get_properties = sourceProperties;
+	info.get_width = sourceWidth;
+	info.get_height = sourceHeight;
+	info.video_tick = sourceTick;
+	info.video_render = sourceRender;
+	info.save = sourceSave;
+	info.key_click = onKey;
+	info.focus = onFocus;
+	return info;
+}
+
+obs_source_info sourceInfo;
+
+} // namespace
 
 bool obs_module_load(void)
 {
-	tetris_source_info.id = "obs_tetris_source";
-	tetris_source_info.type = OBS_SOURCE_TYPE_INPUT;
-	tetris_source_info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
-	tetris_source_info.get_name = tetris_get_name;
-	tetris_source_info.create = tetris_create;
-	tetris_source_info.destroy = tetris_destroy;
-	tetris_source_info.update = tetris_update;
-	tetris_source_info.get_defaults = tetris_defaults;
-	tetris_source_info.get_properties = tetris_properties;
-	tetris_source_info.get_width = tetris_width;
-	tetris_source_info.get_height = tetris_height;
-	tetris_source_info.video_tick = tetris_tick;
-	tetris_source_info.video_render = tetris_render;
-
-	obs_register_source(&tetris_source_info);
-	obs_log(LOG_INFO, "OBS Tetris loaded successfully (version %s)", PLUGIN_VERSION);
+	if (!sp::netStartup())
+		obs_log(LOG_WARNING, "network init failed: Twitch chat and bridge are unavailable");
+	sourceInfo = makeSourceInfo();
+	obs_register_source(&sourceInfo);
+	obs_log(LOG_INFO, "Stack Party loaded (version %s)", PLUGIN_VERSION);
 	return true;
 }
 
 void obs_module_unload(void)
 {
-	obs_log(LOG_INFO, "OBS Tetris unloaded");
+	sp::netShutdown();
+	obs_log(LOG_INFO, "Stack Party unloaded");
 }

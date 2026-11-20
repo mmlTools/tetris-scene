@@ -155,19 +155,38 @@ ${_usage_host:-}"
   cmake --build build_${target##*-} --config ${config} -t package_source ${cmake_args}
   popd
 
+  # User install archive using the OBS Studio 33+ layout. Extract into:
+  #   ${XDG_DATA_HOME:-~/.local/share}/obs-studio/plugins/
+  # resulting in <plugin>/<plugin>.so and <plugin>/data/...
+  log_group "Archiving ${product_name} (OBS 33+ user plugin layout)..."
+  local output_name="${product_name}-${product_version}-${target##*-}-linux-gnu"
+  local install_root=${project_root}/release/${config}
+  local stage_root=${project_root}/release/stage-${target##*-}
+  local _tarflags='cJf'
+  if (( _loglevel > 1 || ${+CI} )) _tarflags="v${_tarflags}"
+
+  local -a binaries=(${install_root}/lib/*/obs-modules/plugins/${product_name}.so(N) ${install_root}/lib/obs-modules/plugins/${product_name}.so(N))
+  if (( ! #binaries )) {
+    log_error "Could not find ${product_name}.so below ${install_root}/lib/*/obs-modules/plugins"
+    return 2
+  }
+
+  rm -rf ${stage_root}
+  mkdir -p ${stage_root}/${product_name}/data
+  cp ${binaries[1]} ${stage_root}/${product_name}/
+  local data_root=${install_root}/share/obs/obs-modules/plugins/${product_name}
+  if [[ -d ${data_root} ]] cp -R ${data_root}/. ${stage_root}/${product_name}/data/
+
+  pushd ${stage_root}
+  XZ_OPT=-T0 tar "-${_tarflags}" ${project_root}/release/${output_name}.tar.xz ${product_name}
+  popd
+  rm -rf ${stage_root}
+
   if (( package )) {
+    # System-wide .deb (installs to /usr/lib/<arch>/obs-modules/plugins and /usr/share/obs/obs-modules/plugins)
     log_group "Packaging ${product_name}..."
     pushd ${project_root}
     cmake --build build_${target##*-} --config ${config} -t package ${cmake_args}
-    popd
-  } else {
-    log_group "Archiving ${product_name}..."
-    local output_name="${product_name}-${product_version}-${target##*-}-ubuntu-gnu"
-    local _tarflags='cJf'
-    if (( _loglevel > 1 || ${+CI} )) _tarflags="v${_tarflags}"
-
-    pushd ${project_root}/release/${config}
-    XZ_OPT=-T0 tar "-${_tarflags}" ${project_root}/release/${output_name}.tar.xz (lib|share)
     popd
   }
   log_group

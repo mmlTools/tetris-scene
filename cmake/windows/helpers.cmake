@@ -22,12 +22,16 @@ function(set_target_properties_plugin target)
 
   set_target_properties(${target} PROPERTIES VERSION 0 SOVERSION ${PLUGIN_VERSION})
 
-  install(TARGETS ${target} RUNTIME DESTINATION "${target}/bin/64bit" LIBRARY DESTINATION "${target}/bin/64bit")
+  # OBS Studio 33+ plugin layout (%ProgramData%/obs-studio/plugins):
+  #   <plugin>/<plugin>.dll
+  #   <plugin>/data/...
+  install(TARGETS ${target} RUNTIME DESTINATION "${target}" LIBRARY DESTINATION "${target}")
 
+  # Debug symbols are kept outside the plugin folder so they are shipped as a separate archive
   install(
     FILES "$<TARGET_PDB_FILE:${target}>"
     CONFIGURATIONS RelWithDebInfo Debug Release
-    DESTINATION "${target}/bin/64bit"
+    DESTINATION "debug-symbols"
     OPTIONAL
   )
 

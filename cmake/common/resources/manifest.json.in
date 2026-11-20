@@ -1,0 +1,16 @@
+{
+  "id": "@CMAKE_PROJECT_NAME@",
+  "name": "@CMAKE_PROJECT_NAME@",
+  "display_name": "Stack Party",
+  "version": "@CMAKE_PROJECT_VERSION@",
+  "os_arch": "@PLUGIN_OS_ARCH@",
+  "description": "A chat-powered falling-block game source. Your viewers help, troll and party along live.",
+  "long_description": "Stack Party is a native OBS source: a cozy falling-block game that your chat can play with (and against) you. Twitch chat commands, subs, bits, raids and first-time chatters trigger on-screen gimmicks such as board flips, disco mode, bombs, golden pieces, a chaos wheel and a Chat Plays mode. A local HTTP bridge lets Streamer.bot, Stream Deck or any bot (YouTube, Kick, ...) trigger them too.",
+  "urls": {
+    "repository": "@PLUGIN_WEBSITE@",
+    "website": "@PLUGIN_WEBSITE@",
+    "support": "@PLUGIN_WEBSITE@"
+  },
+  "has_banner": false,
+  "has_icon": false
+}
