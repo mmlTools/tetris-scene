@@ -71,49 +71,60 @@ function(_setup_obs_studio)
       -DOBS_VERSION_OVERRIDE:STRING=${_obs_version} "-DCMAKE_PREFIX_PATH='${CMAKE_PREFIX_PATH}'" ${_is_fresh}
       ${_cmake_extra}
     RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET
+    OUTPUT_VARIABLE _process_output
+    ERROR_VARIABLE _process_output
   )
+  _check_obs_step("Configure ${label} (${arch})" "${_process_result}" "${_process_output}")
   message(STATUS "Configure ${label} (${arch}) - done")
 
-  message(STATUS "Build ${label} (Debug - ${arch})")
-  execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config Debug --parallel
-    WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
-    RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET
-  )
-  message(STATUS "Build ${label} (Debug - ${arch}) - done")
+  # CI only builds optimized plugin configurations, which map to the Release libobs (see bootstrap.cmake),
+  # so the Debug libobs build is skipped there.
+  if(DEFINED ENV{CI})
+    set(_obs_configs Release)
+  else()
+    set(_obs_configs Debug Release)
+  endif()
 
-  message(STATUS "Build ${label} (Release - ${arch})")
-  execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config Release --parallel
-    WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
-    RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET
-  )
-  message(STATUS "Build ${label} (Reelase - ${arch}) - done")
+  foreach(_cfg IN LISTS _obs_configs)
+    message(STATUS "Build ${label} (${_cfg} - ${arch})")
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config ${_cfg} --parallel
+      WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
+      RESULT_VARIABLE _process_result
+      OUTPUT_VARIABLE _process_output
+      ERROR_VARIABLE _process_output
+    )
+    _check_obs_step("Build ${label} (${_cfg} - ${arch})" "${_process_result}" "${_process_output}")
+    message(STATUS "Build ${label} (${_cfg} - ${arch}) - done")
+  endforeach()
 
   message(STATUS "Install ${label} (${arch})")
-  execute_process(
-    COMMAND
-      "${CMAKE_COMMAND}" --install build_${arch} --component Development --config Debug --prefix "${dependencies_dir}"
-    WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
-    RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET
-  )
-  execute_process(
-    COMMAND
-      "${CMAKE_COMMAND}" --install build_${arch} --component Development --config Release --prefix "${dependencies_dir}"
-    WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
-    RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET
-  )
+  set(_deps "${dependencies_dir}")
+  foreach(_cfg IN LISTS _obs_configs)
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" --install build_${arch} --component Development --config ${_cfg} --prefix "${_deps}"
+      WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
+      RESULT_VARIABLE _process_result
+      OUTPUT_VARIABLE _process_output
+      ERROR_VARIABLE _process_output
+    )
+    _check_obs_step("Install ${label} (${_cfg} - ${arch})" "${_process_result}" "${_process_output}")
+  endforeach()
   message(STATUS "Install ${label} (${arch}) - done")
+endfunction()
+
+# _check_obs_step: Abort with the tail of the captured output when a dependency build step fails
+function(_check_obs_step step result output)
+  if(result EQUAL 0)
+    return()
+  endif()
+  string(LENGTH "${output}" _length)
+  if(_length GREATER 30000)
+    math(EXPR _start "${_length} - 30000")
+    string(SUBSTRING "${output}" ${_start} -1 output)
+    set(output "[...]\n${output}")
+  endif()
+  message(FATAL_ERROR "${step} failed (${result}). Output:\n${output}")
 endfunction()
 
 # _check_dependencies: Fetch and extract pre-built OBS build dependencies

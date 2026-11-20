@@ -40,37 +40,65 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     sudo apt-get install ${apt_args} gcc-${${target##*-}//_/-}-linux-gnu g++-${${target##*-}//_/-}-linux-gnu
   }
 
-  # Distribution libobs-dev packages lag behind: always build against the official OBS Studio PPA,
-  # which ships libobs headers and CMake package files inside the obs-studio package.
-  local ppa_added=0
+  # Distribution obs-studio/libobs-dev packages lag behind (Ubuntu 26.04 ships 32.x): always build against
+  # the official OBS Studio PPA, which ships libobs headers and CMake package files in its obs-studio package.
+  # The PPA is registered explicitly with its own keyring (add-apt-repository can leave it unsigned, which
+  # makes apt silently ignore it) and pinned above the distribution archive.
+  local -r ppa_url='https://ppa.launchpadcontent.net/obsproject/obs-studio/ubuntu'
+  local -r ppa_keyring='/etc/apt/keyrings/obsproject-obs-studio.gpg'
+  local codename
+  codename="$(. /etc/os-release && print -r -- ${VERSION_CODENAME})"
+
+  sudo mkdir -p /etc/apt/keyrings /etc/apt/preferences.d
+
+  local fingerprint
   for attempt in {1..3}; do
-    if sudo add-apt-repository --yes ppa:obsproject/obs-studio; then
-      ppa_added=1
-      break
-    fi
+    fingerprint="$(curl -fsSL https://api.launchpad.net/1.0/~obsproject/+archive/ubuntu/obs-studio | jq -r '.signing_key_fingerprint')" && \
+      [[ ${fingerprint} =~ '^[0-9A-F]{40}$' ]] && \
+      curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${fingerprint}" \
+        | sudo gpg --batch --yes --dearmor -o ${ppa_keyring} && break
+    fingerprint=''
     sleep $(( attempt * 15 ))
   done
 
-  if (( ! ppa_added )) {
-    log_error 'Could not add the obsproject PPA after retries.'
+  if [[ -z ${fingerprint} ]] {
+    log_error 'Could not fetch the obsproject PPA signing key.'
     return 2
   }
+
+  print -r -- "Types: deb
+URIs: ${ppa_url}
+Suites: ${codename}
+Components: main
+Signed-By: ${ppa_keyring}" | sudo tee /etc/apt/sources.list.d/obsproject-obs-studio.sources >/dev/null
+  print -r -- "Package: *
+Pin: release o=LP-PPA-obsproject-obs-studio
+Pin-Priority: 1001" | sudo tee /etc/apt/preferences.d/obsproject-obs-studio >/dev/null
 
   if ! _apt_update; then
     log_error 'apt-get update failed after adding the obsproject PPA.'
     return 2
   fi
 
+  apt-cache policy obs-studio
+
+  local ppa_version
+  ppa_version="$(apt-cache madison obs-studio | awk -F'|' '/launchpadcontent|obsproject/ && !v { gsub(/ /, "", $2); v = $2 } END { print v }')"
+  if [[ -z ${ppa_version} ]] {
+    log_error "The obsproject PPA has no obs-studio package for Ubuntu '${codename}'."
+    return 2
+  }
+
   # Never mix the distribution's libobs-dev with the PPA build
   if dpkg -s libobs-dev >/dev/null 2>&1; then
     sudo apt-get remove ${apt_args} libobs-dev
   fi
 
-  sudo apt-get install ${apt_args} \
+  sudo apt-get install ${apt_args} --allow-downgrades \
     build-essential \
     libgles2-mesa-dev \
     libsimde-dev \
-    obs-studio
+    obs-studio=${ppa_version}
 
   local obs_version
   obs_version="$(dpkg-query -W -f='${Version}' obs-studio 2>/dev/null)"
@@ -78,9 +106,9 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
 
   autoload -Uz is-at-least
   if [[ -z ${obs_version} ]] || ! is-at-least ${obs_minimum_version} ${obs_version}; then
-    log_error "OBS Studio ${obs_minimum_version}+ is required, but the PPA provided '${obs_version}'. Use an Ubuntu release supported by the OBS PPA for OBS ${obs_minimum_version%%.*} (e.g. ubuntu-26.04)."
+    log_error "OBS Studio ${obs_minimum_version}+ is required, but the PPA provided '${obs_version}' for Ubuntu '${codename}'. Use an Ubuntu release the OBS PPA ships OBS ${obs_minimum_version%%.*} for (ubuntu-26.04 or newer)."
     return 2
   fi
-  log_info "Building against OBS Studio ${obs_version}"
+  log_info "Building against OBS Studio ${obs_version} (${ppa_version})"
   log_group
 }
